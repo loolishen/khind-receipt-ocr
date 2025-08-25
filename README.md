@@ -1,0 +1,1 @@
+# khind-receipt-ocr

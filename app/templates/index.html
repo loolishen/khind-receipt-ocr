@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KHIND Receipt OCR</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>KHIND Receipt OCR</h1>
+    <p>Upload your <strong>raw CSV</strong> and an <strong>images.zip</strong> where files are named like <code>Image_X.jpg</code> matching <code>MLP_X</code>.</p>
+    <form action="/process" method="post" enctype="multipart/form-data" class="card">
+      <div class="field">
+        <label>Raw CSV</label>
+        <input type="file" name="raw_csv" accept=".csv" required />
+      </div>
+      <div class="field">
+        <label>Images ZIP</label>
+        <input type="file" name="images_zip" accept=".zip" required />
+      </div>
+      <button type="submit">Process</button>
+    </form>
+    <details class="hint">
+      <summary>What will be extracted?</summary>
+      <ul>
+        <li><strong>Amount spent</strong> (RM)</li>
+        <li><strong>Product purchased (up to 3)</strong> + quantities</li>
+        <li><strong>Store</strong> and <strong>Store Location</strong> (City, State)</li>
+        <li><strong>Validity</strong> + reason if invalid</li>
+      </ul>
+    </details>
+  </div>
+</body>
+</html>

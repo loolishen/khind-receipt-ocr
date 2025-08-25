@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Results — KHIND Receipt OCR</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; }
+    thead { position: sticky; top: 0; background: #fff; }
+    .table-wrap { max-height: 70vh; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Processed Results</h1>
+    <p><strong>{{ row_count }}</strong> rows processed.</p>
+    <div class="actions">
+      <a class="btn" href="{{ csv_url }}" download>Download CSV</a>
+      <a class="btn" href="{{ xlsx_url }}" download>Download XLSX</a>
+      <a class="btn secondary" href="/">Run again</a>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {% for c in columns %}
+              <th>{{ c }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr>
+              {% for c in columns %}
+                <td>{{ r.get(c, "") }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Showing up to the first 50 rows above. Full data is in the downloads.</p>
+  </div>
+</body>
+</html>

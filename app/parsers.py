@@ -1,6 +1,37 @@
 import re
 from typing import List, Tuple, Optional
 
+# ---------------------------------
+# OPTIONAL curated lists (auto-load)
+# ---------------------------------
+# If these modules are present (generated from your CSV),
+# their lists will be used as defaults unless the caller provides one.
+
+# Stores (curated)
+try:
+    from .store_hints_w4 import STORE_HINTS_W4 as PREFERRED_STORE_HINTS  # type: ignore
+except Exception:
+    try:
+        from store_hints_w4 import STORE_HINTS_W4 as PREFERRED_STORE_HINTS  # type: ignore
+    except Exception:
+        PREFERRED_STORE_HINTS = None
+
+# Products / Items (curated)
+PREFERRED_PRODUCT_HINTS: Optional[List[str]] = None
+try:
+    from .product_hints_w4 import PRODUCT_HINTS_W4 as PREFERRED_PRODUCT_HINTS  # type: ignore
+except Exception:
+    try:
+        from product_hints_w4 import PRODUCT_HINTS_W4 as PREFERRED_PRODUCT_HINTS  # type: ignore
+    except Exception:
+        try:
+            from .items_hints_w4 import ITEMS_HINTS_W4 as PREFERRED_PRODUCT_HINTS  # type: ignore
+        except Exception:
+            try:
+                from items_hints_w4 import ITEMS_HINTS_W4 as PREFERRED_PRODUCT_HINTS  # type: ignore
+            except Exception:
+                PREFERRED_PRODUCT_HINTS = None
+
 # -----------------------------
 # constants / helpers
 # -----------------------------
@@ -101,8 +132,12 @@ def _contains_store_hint(text: str) -> bool:
 def extract_store_name(lines: List[str], preferred_stores: Optional[List[str]] = None) -> Optional[str]:
     """
     Prefer user-provided store list; then generic hints; then ALLCAPS; then first non-empty.
-    Pass your curated list from main.py if you want stronger matching.
+    If store_hints_w4.py is available, it is used by default as preferred_stores.
     """
+    # Default to curated list when caller did not pass one
+    if preferred_stores is None and PREFERRED_STORE_HINTS:
+        preferred_stores = PREFERRED_STORE_HINTS
+
     top = lines[:10]
 
     if preferred_stores:
@@ -236,8 +271,58 @@ def _khind_line_amount(lines: List[str]) -> Optional[str]:
 # products
 # -----------------------------
 
-def extract_products(lines: List[str], max_items: int = 3) -> List[Tuple[str, int]]:
+def _match_preferred_items(lines: List[str], preferred_items: List[str], max_items: int) -> List[Tuple[str, int]]:
+    """
+    Greedy substring matching against curated item hints (case-insensitive).
+    Returns unique items in order of first appearance with best-effort qty detection.
+    """
+    out: List[Tuple[str, int]] = []
+    seen = set()
+    pref_up = [(p, p.upper()) for p in preferred_items if isinstance(p, str) and p.strip()]
+    if not pref_up:
+        return out
+
+    for ln in lines:
+        up = ln.upper()
+        for original, needle in pref_up:
+            if needle in up:
+                # normalize quantity if present nearby
+                qty = 1
+                q = QTY_RE.search(ln)
+                if q:
+                    for g in q.groups():
+                        if g and g.isdigit():
+                            qty = int(g); break
+                key = (original.strip().casefold(), qty)
+                if key in seen:
+                    continue
+                out.append((original.strip(), qty))
+                seen.add(key)
+                if len(out) >= max_items:
+                    return out
+    return out
+
+def extract_products(lines: List[str], max_items: int = 3, preferred_items: Optional[List[str]] = None) -> List[Tuple[str, int]]:
+    """
+    Product extraction with priority:
+      1) Curated item hints (if provided or auto-loaded)
+      2) Lines containing 'KHIND' (as product names) + qty detection
+      3) Generic product code heuristic (alphanumeric patterns)
+    Returns a list of (name_or_code, qty).
+    """
+    # NEW: default to curated list when caller did not pass one
+    if preferred_items is None and PREFERRED_PRODUCT_HINTS:
+        preferred_items = PREFERRED_PRODUCT_HINTS
+
     items: List[Tuple[str, int]] = []
+
+    # 1) Curated hints first (if available)
+    if preferred_items:
+        items.extend(_match_preferred_items(lines, preferred_items, max_items))
+        if len(items) >= max_items:
+            return items
+
+    # 2) KHIND lines as product names
     for i, ln in _find_khind_rows(lines):
         name = ln.strip()
         qty = 1
@@ -250,6 +335,7 @@ def extract_products(lines: List[str], max_items: int = 3) -> List[Tuple[str, in
         if len(items) >= max_items:
             return items
 
+    # 3) Generic alphanumeric product codes
     for ln in lines:
         if len(items) >= max_items:
             break

@@ -2,7 +2,8 @@ import io
 import zipfile
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, List
+import re
 
 import pandas as pd
 from fastapi import FastAPI, Request, UploadFile, File
@@ -34,19 +35,37 @@ def _save_zip_to_dir(zf: UploadFile, dest: Path):
         z.extractall(dest)
 
 
-def _scan_images(images_dir: Path, supported_ext: list[str]) -> list[Path]:
+def _scan_images(images_dir: Path, supported_ext: List[str]) -> List[Path]:
     """
-    Return all images under images_dir in **sorted filename order**.
-    We will map them to the CSV rows by index:
-      row 0 (Excel row 2) -> images[0] (e.g., image_0.*)
-      row 1 (Excel row 3) -> images[1], etc.
+    Return all images under images_dir in sorted filename order.
     """
-    images: list[Path] = []
+    images: List[Path] = []
     for p in images_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() in supported_ext:
             images.append(p)
     images.sort(key=lambda x: x.name.lower())
     return images
+
+
+# -------- matching helpers (normalize IDs) --------
+
+_RE_MLP = re.compile(r"(mlp)[_\-\s]*0*(\d+)", re.I)
+
+def _normalize_id(s: str) -> str:
+    """
+    Normalize strings like 'MLP-000572', 'mlp_572', 'mlp 572' -> 'mlp_572'.
+    If no MLP pattern, fallback to a simplified stem-ish token.
+    """
+    s = (s or "").strip()
+    m = _RE_MLP.search(s)
+    if m:
+        return f"{m.group(1).lower()}_{m.group(2)}"
+    # fallback: compact non-alnum, lower
+    s2 = re.sub(r"[^\w]+", "_", s.lower()).strip("_")
+    return s2
+
+def _normalize_stem_from_path(p: Path) -> str:
+    return _normalize_id(p.stem)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -66,8 +85,12 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
     images_list = _scan_images(img_dir, SUPPORTED_EXT)
     print(f"[IMAGES] Found {len(images_list)} images in {img_dir}")
     if images_list:
-        sample = [p.name for p in images_list[:5]]
-        print("[IMAGES] First few:", sample)
+        print("[IMAGES] First few:", [p.name for p in images_list[:5]])
+
+    # Build a lookup: normalized stem -> Path (last one wins if duplicates)
+    img_by_norm: Dict[str, Path] = {}
+    for p in images_list:
+        img_by_norm[_normalize_stem_from_path(p)] = p
 
     # Load raw CSV
     df_raw = pd.read_csv(raw_csv.file)
@@ -93,15 +116,60 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
     ]
     extracted_rows = []
 
+    used_images: set[Path] = set()
+
+    def _pick_image_for_row(row_idx: int, submission_no: str) -> Optional[Path]:
+        """
+        Hybrid strategy:
+        1) Try exact normalized name match (e.g., 'mlp_572') if present and unused.
+        2) Else take row-order image if available and unused.
+        3) Else first unused image (as a last resort).
+        Logs a warning if the chosen image's normalized stem != row's normalized submission.
+        """
+        norm_sub = _normalize_id(submission_no)
+
+        # 1) exact name match
+        p = img_by_norm.get(norm_sub)
+        if p is not None and p not in used_images:
+            used_images.add(p)
+            print(f"[MAP] row {row_idx+2} ({submission_no}) -> {p.name} [EXACT]")
+            return p
+
+        # 2) row-order candidate
+        if row_idx < len(images_list):
+            cand = images_list[row_idx]
+            if cand not in used_images:
+                used_images.add(cand)
+                norm_cand = _normalize_stem_from_path(cand)
+                tag = "[ROW-ORDER MATCH]" if norm_cand == norm_sub else "[ROW-ORDER]"
+                if norm_cand != norm_sub:
+                    print(f"[WARN] row {row_idx+2}: submission '{submission_no}' normalized '{norm_sub}' "
+                          f"!= image stem '{norm_cand}'. Using row-order image.")
+                print(f"[MAP] row {row_idx+2} ({submission_no}) -> {cand.name} {tag}")
+                return cand
+
+        # 3) any first unused image
+        for cand in images_list:
+            if cand not in used_images:
+                used_images.add(cand)
+                norm_cand = _normalize_stem_from_path(cand)
+                if norm_cand != norm_sub:
+                    print(f"[WARN] row {row_idx+2}: fallback picked '{cand.name}' "
+                          f"(norm '{norm_cand}') for submission '{submission_no}' (norm '{norm_sub}').")
+                print(f"[MAP] row {row_idx+2} ({submission_no}) -> {cand.name} [FALLBACK]")
+                return cand
+
+        print(f"[MAP] row {row_idx+2} ({submission_no}) -> None [NO IMAGE LEFT]")
+        return None
+
     for row_idx, row in df_raw.iterrows():
         # --- values from row ---
         submission_no = str(row.get("Submission No", ""))
         fb_city = str(row.get(fallback_city_col, "")) if fallback_city_col else None
         fb_state = str(row.get(fallback_state_col, "")) if fallback_state_col else None
 
-        # --- map to image by row index ---
-        image_path = images_list[row_idx] if row_idx < len(images_list) else None
-        print(f"[MAP] row {row_idx+2} ({submission_no}) -> {image_path}")
+        # --- map to image (hybrid) ---
+        image_path = _pick_image_for_row(row_idx, submission_no)
 
         # --- run OCR (with explicit error flag) ---
         ocr_error = False
@@ -109,12 +177,12 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
         lines: list[str] = []
         if not image_missing:
             try:
-                dbg_raw_path = run_dir / "debug_raw" / f"{submission_no}.json"
+                dbg_raw_path = run_dir / "debug_raw" / f"{_normalize_id(submission_no)}.json"
                 lines = run_ocr(image_path, debug_dump_to=dbg_raw_path)
 
                 dbg_dir = run_dir / "debug_txt"
                 dbg_dir.mkdir(parents=True, exist_ok=True)
-                with open(dbg_dir / f"{submission_no}.txt", "w", encoding="utf-8") as f:
+                with open(dbg_dir / f"{_normalize_id(submission_no)}.txt", "w", encoding="utf-8") as f:
                     f.write("\n".join(lines))
             except Exception as e:
                 ocr_error = True

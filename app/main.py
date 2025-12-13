@@ -4,14 +4,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
 import re
-
 import pandas as pd
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .ocr_extractor import run_ocr
+from .ocr_extractor import run_ocr, _get_ocr  # warmup
 from . import parsers
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,8 +24,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/outputs", StaticFiles(directory=OUTPUTS_DIR), name="outputs")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-SUPPORTED_EXT = [".jpg", ".jpeg", ".png"]  # .svg not reliable for OCR
+SUPPORTED_EXT = [".jpg", ".jpeg", ".png"]
 
+# Toggle heavy debug dumps (JSON/TXT) to speed up
+DEBUG_DUMP_MAX = 3  # dump only for first N rows; set 0 to disable
 
 def _save_zip_to_dir(zf: UploadFile, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
@@ -34,44 +35,30 @@ def _save_zip_to_dir(zf: UploadFile, dest: Path):
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         z.extractall(dest)
 
-
 def _scan_images(images_dir: Path, supported_ext: List[str]) -> List[Path]:
-    """
-    Return all images under images_dir in sorted filename order.
-    """
     images: List[Path] = []
     for p in images_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() in supported_ext:
             images.append(p)
+    # filename sort is fine when names are MLP_XXXX
     images.sort(key=lambda x: x.name.lower())
     return images
-
-
-# -------- matching helpers (normalize IDs) --------
 
 _RE_MLP = re.compile(r"(mlp)[_\-\s]*0*(\d+)", re.I)
 
 def _normalize_id(s: str) -> str:
-    """
-    Normalize strings like 'MLP-000572', 'mlp_572', 'mlp 572' -> 'mlp_572'.
-    If no MLP pattern, fallback to a simplified stem-ish token.
-    """
     s = (s or "").strip()
     m = _RE_MLP.search(s)
     if m:
         return f"{m.group(1).lower()}_{m.group(2)}"
-    # fallback: compact non-alnum, lower
-    s2 = re.sub(r"[^\w]+", "_", s.lower()).strip("_")
-    return s2
+    return re.sub(r"[^\w]+", "_", s.lower()).strip("_")
 
 def _normalize_stem_from_path(p: Path) -> str:
     return _normalize_id(p.stem)
 
-
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
-
 
 @app.post("/process", response_class=HTMLResponse)
 def process(request: Request, raw_csv: UploadFile = File(...), images_zip: UploadFile = File(...)):
@@ -81,23 +68,30 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
     img_dir = run_dir / "images"
     _save_zip_to_dir(images_zip, img_dir)
 
+    # Pre-warm the OCR once (this also triggers model download only once)
+    try:
+        _get_ocr()
+    except Exception as e:
+        print("[WARN] OCR warmup failed:", e)
+
     # Build ordered image list
     images_list = _scan_images(img_dir, SUPPORTED_EXT)
     print(f"[IMAGES] Found {len(images_list)} images in {img_dir}")
     if images_list:
         print("[IMAGES] First few:", [p.name for p in images_list[:5]])
 
-    # Build a lookup: normalized stem -> Path (last one wins if duplicates)
-    img_by_norm: Dict[str, Path] = {}
-    for p in images_list:
-        img_by_norm[_normalize_stem_from_path(p)] = p
+    # Build stem -> path
+    img_by_norm: Dict[str, Path] = { _normalize_stem_from_path(p): p for p in images_list }
 
-    # Load raw CSV
+    # Load CSV
     df_raw = pd.read_csv(raw_csv.file)
     if "Submission No" not in df_raw.columns:
         return HTMLResponse("<h3>CSV missing 'Submission No' column.</h3>", status_code=400)
 
-    # Detect fallback city/state columns (once)
+    # Optional: if you have thousands of rows but only 200 images, bound the loop
+    n_rows = len(df_raw)
+
+    # Detect fallback city/state columns (not used for location anymore in parsers)
     fallback_city_col: Optional[str] = None
     fallback_state_col: Optional[str] = None
     for c in df_raw.columns:
@@ -114,21 +108,14 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
         "Product purchased 3", "Amount purchased 3",
         "Store", "Store Location"
     ]
-    extracted_rows = []
+    extracted_rows: List[dict] = []
 
     used_images: set[Path] = set()
 
     def _pick_image_for_row(row_idx: int, submission_no: str) -> Optional[Path]:
-        """
-        Hybrid strategy:
-        1) Try exact normalized name match (e.g., 'mlp_572') if present and unused.
-        2) Else take row-order image if available and unused.
-        3) Else first unused image (as a last resort).
-        Logs a warning if the chosen image's normalized stem != row's normalized submission.
-        """
         norm_sub = _normalize_id(submission_no)
 
-        # 1) exact name match
+        # 1) exact id match
         p = img_by_norm.get(norm_sub)
         if p is not None and p not in used_images:
             used_images.add(p)
@@ -148,7 +135,7 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
                 print(f"[MAP] row {row_idx+2} ({submission_no}) -> {cand.name} {tag}")
                 return cand
 
-        # 3) any first unused image
+        # 3) first unused
         for cand in images_list:
             if cand not in used_images:
                 used_images.add(cand)
@@ -162,42 +149,37 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
         print(f"[MAP] row {row_idx+2} ({submission_no}) -> None [NO IMAGE LEFT]")
         return None
 
+    # Process rows
     for row_idx, row in df_raw.iterrows():
-        # --- values from row ---
         submission_no = str(row.get("Submission No", ""))
         fb_city = str(row.get(fallback_city_col, "")) if fallback_city_col else None
         fb_state = str(row.get(fallback_state_col, "")) if fallback_state_col else None
 
-        # --- map to image (hybrid) ---
         image_path = _pick_image_for_row(row_idx, submission_no)
 
-        # --- run OCR (with explicit error flag) ---
+        # --- OCR ---
         ocr_error = False
         image_missing = image_path is None
-        lines: list[str] = []
+        lines: List[str] = []
         if not image_missing:
             try:
-                dbg_raw_path = run_dir / "debug_raw" / f"{_normalize_id(submission_no)}.json"
-                lines = run_ocr(image_path, debug_dump_to=dbg_raw_path)
-
-                dbg_dir = run_dir / "debug_txt"
-                dbg_dir.mkdir(parents=True, exist_ok=True)
-                with open(dbg_dir / f"{_normalize_id(submission_no)}.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
+                # Only dump debug for the first few to keep IO low
+                dbg_path = None
+                if DEBUG_DUMP_MAX and row_idx < DEBUG_DUMP_MAX:
+                    dbg_path = (run_dir / "debug_raw" / f"{_normalize_id(submission_no)}.json")
+                lines = run_ocr(image_path, debug_dump_to=dbg_path)
             except Exception as e:
                 ocr_error = True
                 print(f"[OCR ERROR] row {row_idx+2} ({submission_no}) @ {image_path}: {e}")
 
-        # --- parse fields ---
+        # --- Parse ---
         amount_spent = parsers.extract_amount_spent(lines) if lines else None
         store = parsers.extract_store_name(lines) if lines else None
-        store_loc = (
-            parsers.extract_store_location(lines, fb_city, fb_state) if lines
-            else (f"{fb_city}, {fb_state}" if fb_city and fb_state else (fb_state or ""))
-        )
+        # NOTE: extract_store_location ignores participant fallback by design (your latest parser)
+        store_loc = parsers.extract_store_location(lines, fb_city, fb_state) if lines else None
         products = parsers.extract_products(lines, max_items=3) if lines else []
 
-        # --- validity / reason (set ONCE) ---
+        # --- Validity ---
         if image_missing:
             validity, reason = "INVALID", "Image missing"
         elif ocr_error:
@@ -205,7 +187,7 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
         else:
             validity, reason = parsers.decide_validity(amount_spent, products, image_missing=False)
 
-        # --- assemble output row ---
+        # --- Row dict ---
         data = {
             "Amount spent": amount_spent or "",
             "Validity": validity,
@@ -221,7 +203,14 @@ def process(request: Request, raw_csv: UploadFile = File(...), images_zip: Uploa
         }
         extracted_rows.append(data)
 
-    df_new = pd.DataFrame(extracted_rows, columns=new_cols)
+    # Assemble output
+    df_new = pd.DataFrame(extracted_rows, columns=[
+        "Amount spent", "Validity", "Reason for invalid",
+        "Product purchased 1", "Amount purchased 1",
+        "Product purchased 2", "Amount purchased 2",
+        "Product purchased 3", "Amount purchased 3",
+        "Store", "Store Location"
+    ])
     df_out = pd.concat([df_new, df_raw], axis=1)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)

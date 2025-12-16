@@ -1,9 +1,92 @@
+# =========================
+# Web / API
+# =========================
 fastapi
 uvicorn
 jinja2
 python-multipart
+
+# =========================
+# Data & Files
+# =========================
 pandas
 openpyxl
 XlsxWriter
+
+# =========================
+# Imaging & CV
+# =========================
 pillow
-paddleocr
+opencv-python
+numpy
+
+# =========================
+# YOLOv8 (receipt detection / cropping)
+# =========================
+ultralytics
+
+# =========================
+# DeepSeek OCR (Vision + Transformer)
+# =========================
+torch>=2.1
+transformers==4.46.3
+tokenizers==0.20.3
+einops
+addict
+easydict
+
+# =========================
+# Optional GPU speed-up (recommended if CUDA available)
+# =========================
+flash-attn==2.7.3
+
+# =========================
+# VLM / LLM client (DeepSeek, OpenAI-compatible)
+# =========================
+openai
+# =========================
+# Web / API
+# =========================
+fastapi
+uvicorn
+jinja2
+python-multipart
+
+# =========================
+# Data & Files
+# =========================
+pandas
+openpyxl
+XlsxWriter
+
+# =========================
+# Imaging & CV
+# =========================
+pillow
+opencv-python
+numpy
+
+# =========================
+# YOLOv8 (receipt detection / cropping)
+# =========================
+ultralytics
+
+# =========================
+# DeepSeek OCR (Vision + Transformer)
+# =========================
+torch>=2.1
+transformers==4.46.3
+tokenizers==0.20.3
+einops
+addict
+easydict
+
+# =========================
+# Optional GPU speed-up (recommended if CUDA available)
+# =========================
+flash-attn==2.7.3
+
+# =========================
+# VLM / LLM client (DeepSeek, OpenAI-compatible)
+# =========================
+openai
